@@ -6,20 +6,24 @@ import feedparser
 import google.generativeai as genai
 from datetime import datetime
 
-
+# ==========================================
+# ★ 비밀키 로드
+# ==========================================
 try:
-    GEMINI_KEY = st.secrets["API_KEY"]
+    API_KEYS = st.secrets["api_keys"]
+    if isinstance(API_KEYS, str):
+        API_KEYS = [API_KEYS]
 except FileNotFoundError:
-    st.error("API key not found.")
+    st.error("야! .streamlit/secrets.toml 파일이 없잖아!")
     st.stop()
 except KeyError:
-    st.error("API key not found.")
+    st.error("secrets.toml에 'api_keys'가 없다. 오타 냈냐?")
     st.stop()
 
 
-
+# ==========================================
 # 1. 보조 함수
-
+# ==========================================
 def analyze_sentiment(text):
     if not text: return 0
     analysis = TextBlob(text)
@@ -34,285 +38,230 @@ def get_sentiment_label(score):
     else:
         return "Neutral (중립)"
 
-# 2. 유효성 검사 함수 (★ 추가됨)
 
 def validate_ticker(ticker):
-    """티커가 진짜 존재하는지 살짝 찔러보는 함수"""
     try:
         stock = yf.Ticker(ticker)
-        # 1일치 데이터만 가져와서 데이터가 있는지 확인
-        hist = stock.history(period="1d")
-        if hist.empty:
-            return False
-        return True
+        return not stock.history(period="1d").empty
     except:
         return False
 
 
-# 3. 데이터 수집
+def validate_crypto_ticker(ticker):
+    try:
+        if "-" not in ticker and not ticker.endswith("USD"):
+            ticker = f"{ticker}-USD"
+        coin = yf.Ticker(ticker)
+        return not coin.history(period="1d").empty, ticker
+    except:
+        return False, ticker
 
-def get_data(ticker):
-    # --- [A] 구글 뉴스 ---
+
+# ==========================================
+# 2. 데이터 수집
+# ==========================================
+def get_data_stock(ticker):
     rss_url = f"https://news.google.com/rss/search?q={ticker}+stock&hl=en-US&gl=US&ceid=US:en"
     feed = feedparser.parse(rss_url)
 
     news_list = []
     for entry in feed.entries[:10]:
         title = entry.title
-        link = entry.link
-        pub_date = datetime(*entry.published_parsed[:6]) if entry.published_parsed else datetime.now()
         score = analyze_sentiment(title)
-
         news_list.append({
-            "date": pub_date,
+            "date": datetime(*entry.published_parsed[:6]) if entry.published_parsed else datetime.now(),
             "title": title,
-            "url": link,
+            "url": entry.link,
             "sentiment_score": score,
             "sentiment_label": get_sentiment_label(score)
         })
-
     news_df = pd.DataFrame(news_list)
 
-    # --- [B] 주가 데이터 ---
     stock = yf.Ticker(ticker)
     info = stock.info
-
-    current_price = info.get('currentPrice') or info.get('regularMarketPrice') or 0
-    prev_close = info.get('previousClose') or 0
-
-    change_rate = 0
-    if prev_close > 0 and current_price > 0:
-        change_rate = ((current_price - prev_close) / prev_close) * 100
+    curr = info.get('currentPrice') or info.get('regularMarketPrice') or 0
+    prev = info.get('previousClose') or 0
+    rate = ((curr - prev) / prev) * 100 if prev > 0 else 0
 
     stock_info = {
-        "ticker": ticker,
-        "current_price": current_price,
-        "change_rate": change_rate,
-        "high52": info.get('fiftyTwoWeekHigh', 0),
-        "pe_ratio": info.get('trailingPE', 'N/A'),
+        "ticker": ticker, "type": "Stock", "current_price": curr, "change_rate": rate,
+        "high52": info.get('fiftyTwoWeekHigh', 0), "pe_ratio": info.get('trailingPE', 'N/A'),
         "recommendation": info.get('recommendationKey', 'none').upper().replace('_', ' '),
         "target_price": info.get('targetMeanPrice', 0),
         "business_summary": info.get('longBusinessSummary', '정보 없음')[:300] + "..."
     }
-
     return news_df, stock_info
 
 
+def get_data_crypto(ticker):
+    rss_url = f"https://news.google.com/rss/search?q={ticker}+crypto&hl=en-US&gl=US&ceid=US:en"
+    feed = feedparser.parse(rss_url)
 
-# 4. Gemini AI 분석
+    news_list = []
+    for entry in feed.entries[:10]:
+        title = entry.title
+        score = analyze_sentiment(title)
+        news_list.append({
+            "date": datetime(*entry.published_parsed[:6]) if entry.published_parsed else datetime.now(),
+            "title": title,
+            "url": entry.link,
+            "sentiment_score": score,
+            "sentiment_label": get_sentiment_label(score)
+        })
+    news_df = pd.DataFrame(news_list)
 
-def get_ai_analysis(api_key, stock_info, news_df):
-    genai.configure(api_key=api_key)
+    coin = yf.Ticker(ticker)
+    info = coin.info
+    curr = info.get('regularMarketPrice') or info.get('currentPrice') or 0
+    prev = info.get('previousClose') or 0
+    rate = ((curr - prev) / prev) * 100 if prev > 0 else 0
 
-    model = None
-    model_name_used = "Unknown"
+    stock_info = {
+        "ticker": ticker, "type": "Crypto", "current_price": curr, "change_rate": rate,
+        "high52": info.get('fiftyTwoWeekHigh', 0),
+        "volume": info.get('volume24Hr') or info.get('regularMarketVolume') or 0,
+        "market_cap": info.get('marketCap', 0),
+        "circulating_supply": info.get('circulatingSupply', 0),
+        "business_summary": info.get('description', '정보 없음')[:300] + "..."
+    }
+    return news_df, stock_info
 
-    try:
-        available_models = list(genai.list_models())
-    except Exception as e:
-        return f"모델 목록 조회 실패. 키 확인해라. 에러: {e}"
 
-    # 모델 선택 로직 (Flash -> Pro -> Any)
-    for m in available_models:
-        if 'generateContent' in m.supported_generation_methods:
-            if 'flash' in m.name:
-                model = genai.GenerativeModel(m.name)
-                model_name_used = m.name
-                break
+# ==========================================
+# 3. Gemini AI 분석 (★ 모델 3단 변신 로직)
+# ==========================================
+def get_ai_analysis(api_keys_list, market_info, news_df):
+    # 1. 우선순위 모델 리스트 정의 (순서 중요)
+    candidate_models = [
+        "gemini-2.5-flash",  # 1순위
+        "gemini-2.5-flash-lite",  # 2순위
+        "gemini-3-flash"  # 3순위 (미래 or 고성능)
+    ]
 
-    if model is None:
-        for m in available_models:
-            if 'generateContent' in m.supported_generation_methods and 'pro' in m.name:
-                model = genai.GenerativeModel(m.name)
-                model_name_used = m.name
-                break
+    # 2. 프롬프트 미리 구성 (모델 돌릴 때마다 만들면 낭비니까)
+    news_txt = "\n".join([f"- {r['title']} ({r['sentiment_label']})" for _, r in
+                          news_df.iterrows()]) if not news_df.empty else "뉴스 없음"
 
-    if model is None:
-        for m in available_models:
-            if 'generateContent' in m.supported_generation_methods:
-                model = genai.GenerativeModel(m.name)
-                model_name_used = m.name
-                break
-
-    if model is None:
-        return "❌ 쓸 수 있는 모델이 하나도 없다."
-
-    if news_df.empty:
-        news_titles = "최근 관련 뉴스가 없습니다."
+    asset_type = market_info.get('type', 'Stock')
+    if asset_type == "Crypto":
+        fund_txt = f"- 시총: ${market_info['market_cap']:,}\n- 거래량: {market_info['volume']:,}\n- 유통량: {market_info['circulating_supply']:,}"
+        point = "온체인 데이터, 고래, 규제"
     else:
-        news_titles = "\n".join([f"- {row['title']} ({row['sentiment_label']})" for _, row in news_df.iterrows()])
+        fund_txt = f"- PER: {market_info['pe_ratio']}\n- 의견: {market_info['recommendation']}\n- 목표가: ${market_info['target_price']}"
+        point = "실적, 금리, 펀더멘털"
 
     prompt = f"""
-    너는 월가에서 가장 냉철하고 분석적인 주식 애널리스트야. 
-    아래 제공된 데이터를 바탕으로 '{stock_info['ticker']}' 종목에 대한 투자 보고서를 작성해줘.
+    너는 1타 애널리스트야. '{market_info['ticker']}' 투자 보고서를 써.
 
-    **작성 원칙:**
-    1. 한국어로 작성할 것.
-    2. 전문 용어를 적절히 섞되, 초보자도 이해할 수 있게 쉽게 설명할 것.
-    3. 뻔한 소리 하지 말고, 데이터에 근거해서 날카롭게 분석할 것.
-    4. 출력 형식은 가독성 좋은 마크다운(Markdown)으로.
+    [데이터]
+    - 현재가: ${market_info['current_price']} ({market_info['change_rate']:.2f}%)
+    {fund_txt}
 
-    ---
-    **[기업 개요]**
-    - 현재가: ${stock_info['current_price']}
-    - 52주 최고가: ${stock_info['high52']}
-    - PER(주가수익비율): {stock_info['pe_ratio']}
-    - 투자의견(컨센서스): {stock_info['recommendation']}
-    - 목표주가: ${stock_info['target_price']}
-    - 사업 요약: {stock_info['business_summary']}
+    [뉴스]
+    {news_txt}
 
-    **[최신 뉴스 헤드라인 및 감성]**
-    {news_titles}
-
-    ---
-    **[요청사항 - 보고서 목차]**
-    1. **🧐 시장 분위기 및 뉴스 분석**: 뉴스들의 전반적인 톤앤매너와 주요 이슈 요약.
-    2. **📊 펀더멘털 진단**: 현재 주가가 고평가인지 저평가인지, 목표주가 괴리율 등을 분석.
-    3. **⚡ 최종 투자 의견**: 
-       - 결론을 **[매수 / 매도 / 관망]** 중 하나로 명확히 내리고, 그 이유를 3줄 요약해줘.
+    [요청]
+    '{point}' 중점 심층 분석. 결론(매수/매도/관망) 도출. 언어는 한국어, 마크다운 형식으로 출력. 데이터에 근거하여 날카롭게 분석.
     """
 
-    try:
-        response = model.generate_content(prompt)
-        return f"🤖 **사용된 모델:** `{model_name_used}`\n\n" + response.text
-    except Exception as e:
-        return f"🤯 분석하다 터짐 ({model_name_used}): {e}"
+    # 3. [키 순회] -> [모델 순회] 이중 루프
+    for i, key in enumerate(api_keys_list):
+        for model_name in candidate_models:
+            try:
+                # 키 설정 및 모델 생성
+                genai.configure(api_key=key)
+                model = genai.GenerativeModel(model_name)
+
+                # 시도
+                response = model.generate_content(prompt)
+
+                # 성공 시 바로 리턴 (함수 종료)
+                return response.text
+
+            except Exception as e:
+                # 실패 로그 찍고 continue (다음 모델 or 다음 키로 넘어감)
+                print(f"Key #{i + 1} | Model '{model_name}' Fail: {e}")
+                continue
+
+    # 모든 키와 모델이 다 실패했을 때
+    return f"🤯 모든 키가 전사했거나, 모델들({candidate_models})을 찾을 수 없다."
 
 
 # ==========================================
-# 5. UI 구성
+# 4. UI 구성
 # ==========================================
-st.set_page_config(page_title="AI 주식 분석", layout="wide")
+st.set_page_config(page_title="AI 투자 분석", layout="wide")
 
-# 말풍선 스타일 CSS 정의
 st.markdown("""
 <style>
-    /* 말풍선 본체 */
     .bubble {
-        position: relative;
-        background: #ffdddd;
-        border: 2px solid #ff0000;
-        color: #d8000c;
-        font-family: Arial, sans-serif;
-        font-size: 14px;
-        font-weight: bold;
-        padding: 10px;
-        border-radius: 10px;
-        margin-bottom: 15px; /* 입력창이랑 간격 */
-        width: fit-content;
-        animation: fadeIn 0.5s;
+        position: relative; background: #ffdddd; border: 2px solid #ff0000;
+        color: #d8000c; font-weight: bold; padding: 10px; border-radius: 10px;
+        margin-bottom: 15px; width: fit-content; animation: fadeIn 0.5s;
     }
-
-    /* 말풍선 꼬리 (아래쪽 화살표) */
     .bubble:after {
-        content: '';
-        position: absolute;
-        bottom: 0;
-        left: 20px; /* 꼬리 위치 */
-        width: 0;
-        height: 0;
-        border: 10px solid transparent;
-        border-top-color: #ff0000;
-        border-bottom: 0;
-        margin-left: -10px;
-        margin-bottom: -10px;
+        content: ''; position: absolute; bottom: 0; left: 20px; width: 0; height: 0;
+        border: 10px solid transparent; border-top-color: #ff0000; border-bottom: 0;
+        margin-left: -10px; margin-bottom: -10px;
     }
-
-    /* 등장 애니메이션 */
-    @keyframes fadeIn {
-        from { opacity: 0; transform: translateY(-10px); }
-        to { opacity: 1; transform: translateY(0); }
-    }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🤖 AI 주식 분석 리포트")
-st.caption("Copyright © Made by sean-kim-27 (github) | Powered by Gemini | ⚠️ 투자는 본인의 선택이며 책임은 지지 않습니다.")
+st.title("🤖 AI 투자 분석 리포트")
+st.caption(f"🔑 로드된 API 키: {len(API_KEYS)}개 | Models: 2.5-flash -> lite -> 3-flash")
 
-# ★ 여기가 중요함: 에러 메시지가 뜰 공간(Placeholder)을 미리 잡아둠
-error_placeholder = st.empty()
+tab_stock, tab_crypto = st.tabs(["📉 주식", "🪙 암호화폐"])
 
-col1, col2 = st.columns([4, 1])
-with col1:
-    ticker = st.text_input("티커 입력", "TSLA", label_visibility="collapsed")
-with col2:
-    st.markdown("<div style='margin-top: -5px;'></div>", unsafe_allow_html=True)
-    btn = st.button("분석", use_container_width=True)
-
-if btn:
-    if not ticker:
-        # 티커 입력 안 했을 때 말풍선
-        error_placeholder.markdown("""
-            <div class="bubble"> 티커를 입력해주세요. </div>
-        """, unsafe_allow_html=True)
-    else:
-        # 티커 검증
-        with st.spinner("티커 확인 중..."):
-            is_valid = validate_ticker(ticker)
-
-        if not is_valid:
-            # 존재하지 않는 티커일 때 말풍선
-            error_placeholder.markdown(f"""
-                <div class="bubble">'{ticker}'는 존재하지 않는 티커입니다.</div>
-            """, unsafe_allow_html=True)
+with tab_stock:
+    e_stock = st.empty()
+    c1, c2 = st.columns([4, 1])
+    ticker = c1.text_input("티커 (예: TSLA)", "TSLA", key="s_in", label_visibility="collapsed")
+    if c2.button("분석", key="s_btn", use_container_width=True):
+        if not ticker:
+            e_stock.markdown('<div class="bubble">입력해라.</div>', unsafe_allow_html=True)
+        elif not validate_ticker(ticker):
+            e_stock.markdown(f'<div class="bubble">\'{ticker}\' 없다.</div>', unsafe_allow_html=True)
         else:
-            # 정상일 때 에러 메시지 삭제하고 분석 시작
-            error_placeholder.empty()
-
-            with st.spinner(f"'{ticker}' 분석 중..."):
-                df, s_info = get_data(ticker)
-                ai_report = get_ai_analysis(GEMINI_KEY, s_info, df)
+            e_stock.empty()
+            with st.spinner("분석 중..."):
+                df, info = get_data_stock(ticker)
+                rpt = get_ai_analysis(API_KEYS, info, df)
 
                 st.divider()
                 m1, m2, m3, m4 = st.columns(4)
+                m1.metric("현재가", f"${info['current_price']}", f"{info['change_rate']:.2f}%")
+                m2.metric("목표가", f"${info['target_price']}")
+                m3.metric("PER", info['pe_ratio'])
+                m4.metric("의견", info['recommendation'])
+                st.subheader(f"📝 {info['ticker']} 리포트")
+                st.markdown(rpt)
+                with st.expander("뉴스"): st.dataframe(df[['date', 'title', 'sentiment_label', 'url']], hide_index=True)
 
-                m1.metric("현재가", f"${s_info['current_price']}", f"{s_info['change_rate']:.2f}%")
-                m2.metric("목표주가", f"${s_info['target_price']}")
-                m3.metric("PER", s_info['pe_ratio'])
-                m4.metric("월가 의견", s_info['recommendation'])
+with tab_crypto:
+    e_crypto = st.empty()
+    c1, c2 = st.columns([4, 1])
+    c_ticker = c1.text_input("코인 (예: BTC)", "BTC", key="c_in", label_visibility="collapsed")
+    if c2.button("분석", key="c_btn", use_container_width=True):
+        if not c_ticker:
+            e_crypto.markdown('<div class="bubble">입력해라.</div>', unsafe_allow_html=True)
+        else:
+            valid, real_t = validate_crypto_ticker(c_ticker)
+            if not valid:
+                e_crypto.markdown(f'<div class="bubble">\'{c_ticker}\' 없다.</div>', unsafe_allow_html=True)
+            else:
+                e_crypto.empty()
+                with st.spinner("분석 중..."):
+                    df, info = get_data_crypto(real_t)
+                    rpt = get_ai_analysis(API_KEYS, info, df)
 
-                st.subheader(f"📝 Gemini의 '{ticker}' 심층 분석")
-                st.markdown(ai_report)
-
-                with st.expander("📚 분석에 참고한 뉴스 원문 보기"):
-                    if not df.empty:
-                        st.dataframe(
-                            df[['date', 'title', 'sentiment_label', 'url']],
-                            column_config={
-                                "date": st.column_config.DatetimeColumn("날짜", format="YYYY-MM-DD HH:mm"),
-                                "title": "기사 제목",
-                                "sentiment_label": "감성(AI분석)",
-                                "url": st.column_config.LinkColumn("링크", display_text="기사 보기")
-                            },
-                            hide_index=True,
-                            use_container_width=True
-                        )
-                    else:
-                        st.info("뉴스 데이터가 없음.")
-
-# ==========================================
-# ★ 푸터 (배경색 자동 맞춤 + 선 제거)
-# ==========================================
-st.markdown(
-    """
-    <style>
-    .footer {
-        position: fixed;
-        left: 0;
-        bottom: 0;
-        width: 100%;
-        background-color: var(--primary-background-color);
-        color: var(--text-color);
-        text-align: center;
-        padding: 10px;
-        font-size: 12px;
-        z-index: 999;
-        border-top: none; 
-    }
-    </style>
-    <div class="footer">
-        <p></p>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+                    st.divider()
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("현재가", f"${info['current_price']}", f"{info['change_rate']:.2f}%")
+                    k2.metric("시가총액", f"${info['market_cap']:,}")
+                    k3.metric("거래량", f"${info['volume']:,}")
+                    k4.metric("유통량", f"{info['circulating_supply']:,}")
+                    st.subheader(f"🪙 {info['ticker']} 리포트")
+                    st.markdown(rpt)
+                    with st.expander("뉴스"): st.dataframe(df[['date', 'title', 'sentiment_label', 'url']],
+                                                         hide_index=True)
