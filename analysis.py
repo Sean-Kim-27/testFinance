@@ -1,272 +1,317 @@
 import streamlit as st
-import requests
 import pandas as pd
 import yfinance as yf
-from datetime import timedelta, datetime
+from textblob import TextBlob
+import feedparser
+import google.generativeai as genai
+from datetime import datetime
 
-# ==========================================
-# ★★★ 설정 (여기에 니 키를 박아둠) ★★★
-# ==========================================
-# 화면에는 절대 안 나옴. 너만 알고 있는 거임.
-API_KEY = st.secrets["API_KEY"]
 
-# ==========================================
-# 1. 보조 함수: 기업 재무 정보 (OVERVIEW)
-# ==========================================
-def get_company_overview(ticker, api_key):
-    url = f"https://www.alphavantage.co/query?function=OVERVIEW&symbol={ticker}&apikey={api_key}"
+try:
+    GEMINI_KEY = st.secrets["API_KEY"]
+except FileNotFoundError:
+    st.error("API key not found.")
+    st.stop()
+except KeyError:
+    st.error("API key not found.")
+    st.stop()
+
+
+
+# 1. 보조 함수
+
+def analyze_sentiment(text):
+    if not text: return 0
+    analysis = TextBlob(text)
+    return analysis.sentiment.polarity
+
+
+def get_sentiment_label(score):
+    if score > 0.1:
+        return "Bullish (긍정)"
+    elif score < -0.1:
+        return "Bearish (부정)"
+    else:
+        return "Neutral (중립)"
+
+# 2. 유효성 검사 함수 (★ 추가됨)
+
+def validate_ticker(ticker):
+    """티커가 진짜 존재하는지 살짝 찔러보는 함수"""
     try:
-        response = requests.get(url, timeout=5)
-        data = response.json()
-        if "Symbol" not in data:
-            return None
-        return data
+        stock = yf.Ticker(ticker)
+        # 1일치 데이터만 가져와서 데이터가 있는지 확인
+        hist = stock.history(period="1d")
+        if hist.empty:
+            return False
+        return True
     except:
-        return None
+        return False
 
 
-# ==========================================
-# 2. 메인 분석 함수
-# ==========================================
-def get_ticker_analysis(ticker, api_key):
-    # --- [A] 뉴스 데이터 ---
-    url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={ticker}&apikey={api_key}&limit=50"
+# 3. 데이터 수집
 
-    try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-    except Exception as e:
-        return None, None, None, f"통신 에러: {e}"
-
-    if "feed" not in data:
-        # API 키 한도 초과거나 틀렸을 때
-        return None, None, None, "뉴스 데이터가 없거나 API 키 문제"
+def get_data(ticker):
+    # --- [A] 구글 뉴스 ---
+    rss_url = f"https://news.google.com/rss/search?q={ticker}+stock&hl=en-US&gl=US&ceid=US:en"
+    feed = feedparser.parse(rss_url)
 
     news_list = []
-    for item in data["feed"]:
+    for entry in feed.entries[:10]:
+        title = entry.title
+        link = entry.link
+        pub_date = datetime(*entry.published_parsed[:6]) if entry.published_parsed else datetime.now()
+        score = analyze_sentiment(title)
+
         news_list.append({
-            "time_published": item["time_published"],
-            "title": item["title"],
-            "summary": item["summary"],
-            "url": item["url"],
-            "sentiment_score": float(item["overall_sentiment_score"]),
-            "sentiment_label": item["overall_sentiment_label"]
+            "date": pub_date,
+            "title": title,
+            "url": link,
+            "sentiment_score": score,
+            "sentiment_label": get_sentiment_label(score)
         })
 
     news_df = pd.DataFrame(news_list)
 
-    # --- [B] 날짜 변환 ---
-    news_df['datetime'] = pd.to_datetime(news_df['time_published'], format='%Y%m%dT%H%M%S')
+    # --- [B] 주가 데이터 ---
+    stock = yf.Ticker(ticker)
+    info = stock.info
 
-    if news_df['datetime'].dt.tz is None:
-        news_df['datetime'] = news_df['datetime'].dt.tz_localize('UTC')
-    else:
-        news_df['datetime'] = news_df['datetime'].dt.tz_convert('UTC')
+    current_price = info.get('currentPrice') or info.get('regularMarketPrice') or 0
+    prev_close = info.get('previousClose') or 0
 
-    news_df['datetime'] = news_df['datetime'].dt.tz_convert('US/Eastern')
-
-    def adjust_date(row):
-        if row.hour >= 16:
-            return (row + timedelta(days=1)).date()
-        else:
-            return row.date()
-
-    news_df['date'] = news_df['datetime'].apply(adjust_date)
-    news_df['date'] = pd.to_datetime(news_df['date'])
-
-    # --- [C] 주가 데이터 ---
-    start_date = news_df['date'].min() - timedelta(days=5)
-    end_date = datetime.now().date() + timedelta(days=1)
-
-    try:
-        stock_df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-    except Exception as e:
-        return None, None, None, f"주가 다운로드 실패: {e}"
-
-    if stock_df.empty:
-        return None, None, None, "주가 데이터 없음 (티커 확인)"
-
-    if isinstance(stock_df.columns, pd.MultiIndex):
-        stock_df.columns = stock_df.columns.get_level_values(0)
-
-    stock_df = stock_df.reset_index()
-    stock_df['Date'] = pd.to_datetime(stock_df['Date']).dt.tz_localize(None)
-    news_df['date'] = pd.to_datetime(news_df['date']).dt.tz_localize(None)
-
-    # --- [D] 현재가 및 등락률 ---
-    latest_stock = stock_df.iloc[-1]
-    prev_stock = stock_df.iloc[-2] if len(stock_df) > 1 else latest_stock
-
-    current_price = float(latest_stock['Close'])
-    prev_close = float(prev_stock['Close'])
-    change_rate = ((current_price - prev_close) / prev_close) * 100
+    change_rate = 0
+    if prev_close > 0 and current_price > 0:
+        change_rate = ((current_price - prev_close) / prev_close) * 100
 
     stock_info = {
+        "ticker": ticker,
         "current_price": current_price,
         "change_rate": change_rate,
-        "prev_close": prev_close
+        "high52": info.get('fiftyTwoWeekHigh', 0),
+        "pe_ratio": info.get('trailingPE', 'N/A'),
+        "recommendation": info.get('recommendationKey', 'none').upper().replace('_', ' '),
+        "target_price": info.get('targetMeanPrice', 0),
+        "business_summary": info.get('longBusinessSummary', '정보 없음')[:300] + "..."
     }
 
-    # --- [E] 상관관계 ---
-    merged_df = pd.merge(news_df, stock_df, left_on='date', right_on='Date', how='inner')
-
-    correlation = 0
-    if not merged_df.empty:
-        daily_analysis = merged_df.groupby('date').agg({
-            'sentiment_score': 'mean',
-            'Close': 'last',
-            'Open': 'first'
-        }).reset_index()
-
-        daily_analysis['Daily_Return'] = (daily_analysis['Close'] - daily_analysis['Open']) / daily_analysis['Open']
-        correlation = daily_analysis['sentiment_score'].corr(daily_analysis['Daily_Return'])
-
-    # --- [F] 기업 개요 ---
-    overview_data = get_company_overview(ticker, api_key)
-
-    return merged_df, correlation, stock_info, overview_data
+    return news_df, stock_info
 
 
-# ==========================================
-# 3. 전망 생성기
-# ==========================================
-def generate_outlook(corr, recent_sentiment, stock_info, overview):
-    outlook_msg = ""
-    reasons = []
 
-    # 1. 상관관계
-    if abs(corr) > 0.3:
-        if corr > 0:
-            reasons.append(f"✅ **뉴스 민감도 높음**: 뉴스 좋으면 주가도 오름.")
-        else:
-            reasons.append(f"⚠️ **뉴스 민감도 낮음**: 뉴스와 주가가 반대로 감.")
+# 4. Gemini AI 분석
+
+def get_ai_analysis(api_key, stock_info, news_df):
+    genai.configure(api_key=api_key)
+
+    model = None
+    model_name_used = "Unknown"
+
+    try:
+        available_models = list(genai.list_models())
+    except Exception as e:
+        return f"모델 목록 조회 실패. 키 확인해라. 에러: {e}"
+
+    # 모델 선택 로직 (Flash -> Pro -> Any)
+    for m in available_models:
+        if 'generateContent' in m.supported_generation_methods:
+            if 'flash' in m.name:
+                model = genai.GenerativeModel(m.name)
+                model_name_used = m.name
+                break
+
+    if model is None:
+        for m in available_models:
+            if 'generateContent' in m.supported_generation_methods and 'pro' in m.name:
+                model = genai.GenerativeModel(m.name)
+                model_name_used = m.name
+                break
+
+    if model is None:
+        for m in available_models:
+            if 'generateContent' in m.supported_generation_methods:
+                model = genai.GenerativeModel(m.name)
+                model_name_used = m.name
+                break
+
+    if model is None:
+        return "❌ 쓸 수 있는 모델이 하나도 없다."
+
+    if news_df.empty:
+        news_titles = "최근 관련 뉴스가 없습니다."
     else:
-        reasons.append(f"ℹ️ **뉴스 민감도 상관X**: 뉴스와 주가는 별개임.")
+        news_titles = "\n".join([f"- {row['title']} ({row['sentiment_label']})" for _, row in news_df.iterrows()])
 
-    # 2. 최근 뉴스 분위기
-    if recent_sentiment > 0.15:
-        reasons.append("🔥 **최근 분위기**: 뉴스 분위기 아주 좋음 (Bullish).")
-        sentiment_score = 1
-    elif recent_sentiment < -0.15:
-        reasons.append("❄️ **최근 분위기**: 악재가 좀 있음 (Bearish).")
-        sentiment_score = -1
-    else:
-        reasons.append("☁️ **최근 분위기**: 중립적임 (Neutral).")
-        sentiment_score = 0
+    prompt = f"""
+    너는 월가에서 가장 냉철하고 분석적인 주식 애널리스트야. 
+    아래 제공된 데이터를 바탕으로 '{stock_info['ticker']}' 종목에 대한 투자 보고서를 작성해줘.
 
-    # 3. 밸류에이션
-    if overview:
-        try:
-            target_price = float(overview.get('AnalystTargetPrice', 0))
-            current_price = stock_info['current_price']
+    **작성 원칙:**
+    1. 한국어로 작성할 것.
+    2. 전문 용어를 적절히 섞되, 초보자도 이해할 수 있게 쉽게 설명할 것.
+    3. 뻔한 소리 하지 말고, 데이터에 근거해서 날카롭게 분석할 것.
+    4. 출력 형식은 가독성 좋은 마크다운(Markdown)으로.
 
-            if target_price > 0:
-                upside = ((target_price - current_price) / current_price) * 100
-                reasons.append(f"💰 **목표 주가**: ${target_price} (상승 여력 {upside:.1f}%)")
+    ---
+    **[기업 개요]**
+    - 현재가: ${stock_info['current_price']}
+    - 52주 최고가: ${stock_info['high52']}
+    - PER(주가수익비율): {stock_info['pe_ratio']}
+    - 투자의견(컨센서스): {stock_info['recommendation']}
+    - 목표주가: ${stock_info['target_price']}
+    - 사업 요약: {stock_info['business_summary']}
 
-                if upside > 20:
-                    outlook_msg = "🚀 **강력 매수**"
-                elif upside > 5:
-                    outlook_msg = "↗️ **매수**"
-                elif upside > -10:
-                    outlook_msg = "⏸️ **보유**"
-                else:
-                    outlook_msg = "↘️ **매도 고민**"
-            else:
-                outlook_msg = "🤔 **판단 보류**"
-        except:
-            outlook_msg = "🤔 **판단 보류**"
-    else:
-        if sentiment_score == 1 and corr > 0.2:
-            outlook_msg = "↗️ **단기 상승**"
-        elif sentiment_score == -1 and corr > 0.2:
-            outlook_msg = "↘️ **단기 하락**"
-        else:
-            outlook_msg = "⏸️ **관망**"
+    **[최신 뉴스 헤드라인 및 감성]**
+    {news_titles}
 
-    return outlook_msg, reasons
+    ---
+    **[요청사항 - 보고서 목차]**
+    1. **🧐 시장 분위기 및 뉴스 분석**: 뉴스들의 전반적인 톤앤매너와 주요 이슈 요약.
+    2. **📊 펀더멘털 진단**: 현재 주가가 고평가인지 저평가인지, 목표주가 괴리율 등을 분석.
+    3. **⚡ 최종 투자 의견**: 
+       - 결론을 **[매수 / 매도 / 관망]** 중 하나로 명확히 내리고, 그 이유를 3줄 요약해줘.
+    """
+
+    try:
+        response = model.generate_content(prompt)
+        return f"🤖 **사용된 모델:** `{model_name_used}`\n\n" + response.text
+    except Exception as e:
+        return f"🤯 분석하다 터짐 ({model_name_used}): {e}"
 
 
 # ==========================================
-# 4. 스트림릿 UI (깔끔 버전)
+# 5. UI 구성
 # ==========================================
-st.set_page_config(page_title="주식 분석기", layout="wide")
+st.set_page_config(page_title="AI 주식 분석", layout="wide")
 
-st.title("📈 해외주식 티커 분석기")
-st.markdown("Bearish : 약세, Bullish : 강세, Neutral : 중립")
+# 말풍선 스타일 CSS 정의
+st.markdown("""
+<style>
+    /* 말풍선 본체 */
+    .bubble {
+        position: relative;
+        background: #ffdddd;
+        border: 2px solid #ff0000;
+        color: #d8000c;
+        font-family: Arial, sans-serif;
+        font-size: 14px;
+        font-weight: bold;
+        padding: 10px;
+        border-radius: 10px;
+        margin-bottom: 15px; /* 입력창이랑 간격 */
+        width: fit-content;
+        animation: fadeIn 0.5s;
+    }
 
-# 사이드바 없애버림
+    /* 말풍선 꼬리 (아래쪽 화살표) */
+    .bubble:after {
+        content: '';
+        position: absolute;
+        bottom: 0;
+        left: 20px; /* 꼬리 위치 */
+        width: 0;
+        height: 0;
+        border: 10px solid transparent;
+        border-top-color: #ff0000;
+        border-bottom: 0;
+        margin-left: -10px;
+        margin-bottom: -10px;
+    }
+
+    /* 등장 애니메이션 */
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(-10px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🤖 AI 주식 분석 리포트")
+
+# ★ 여기가 중요함: 에러 메시지가 뜰 공간(Placeholder)을 미리 잡아둠
+error_placeholder = st.empty()
 
 col1, col2 = st.columns([4, 1])
 with col1:
-    ticker_input = st.text_input("티커 입력", value="ORCL", label_visibility="collapsed", placeholder="티커 입력...")
+    ticker = st.text_input("티커 입력", "TSLA", label_visibility="collapsed")
 with col2:
     st.markdown("<div style='margin-top: -5px;'></div>", unsafe_allow_html=True)
-    analyze_btn = st.button("분석", use_container_width=True)
+    btn = st.button("분석", use_container_width=True)
 
-if analyze_btn:
-    if not ticker_input:
-        st.error("티커를 넣어주세요 .")
+if btn:
+    if not ticker:
+        # 티커 입력 안 했을 때 말풍선
+        error_placeholder.markdown("""
+            <div class="bubble"> 티커를 입력해주세요. </div>
+        """, unsafe_allow_html=True)
     else:
-        with st.spinner(f"'{ticker_input}' 분석 중..."):
-            # 전역 변수 API_KEY 사용
-            df, corr, stock_info, overview = get_ticker_analysis(ticker_input, API_KEY)
+        # 티커 검증
+        with st.spinner("티커 확인 중..."):
+            is_valid = validate_ticker(ticker)
 
-        if isinstance(overview, str):
-            st.error(f"에러 발생: {overview}")
-        elif df is None:
-            st.error("API 키가 만료됐거나 티커가 잘못 입력되었습니다.")
+        if not is_valid:
+            # 존재하지 않는 티커일 때 말풍선
+            error_placeholder.markdown(f"""
+                <div class="bubble">'{ticker}'는 존재하지 않는 티커입니다.</div>
+            """, unsafe_allow_html=True)
         else:
-            # 1. 현재가 & 등락률
-            st.divider()
-            m1, m2, m3, m4 = st.columns(4)
+            # 정상일 때 에러 메시지 삭제하고 분석 시작
+            error_placeholder.empty()
 
-            with m1:
-                st.metric(
-                    label="현재 주가",
-                    value=f"${stock_info['current_price']:.2f}",
-                    delta=f"{stock_info['change_rate']:.2f}%"
-                )
-            with m2:
-                st.metric(label="뉴스 민감도", value=f"{corr:.2f}")
+            with st.spinner(f"'{ticker}' 분석 중..."):
+                df, s_info = get_data(ticker)
+                ai_report = get_ai_analysis(GEMINI_KEY, s_info, df)
 
-            with m3:
-                if overview:
-                    high52 = overview.get('52WeekHigh', '-')
-                    st.metric(label="52주 최고가", value=f"${high52}")
+                st.divider()
+                m1, m2, m3, m4 = st.columns(4)
 
-            with m4:
-                if overview:
-                    pe = overview.get('PERatio', '-')
-                    st.metric(label="PER", value=pe)
+                m1.metric("현재가", f"${s_info['current_price']}", f"{s_info['change_rate']:.2f}%")
+                m2.metric("목표주가", f"${s_info['target_price']}")
+                m3.metric("PER", s_info['pe_ratio'])
+                m4.metric("월가 의견", s_info['recommendation'])
 
-            # 2. 종합 전망
-            st.divider()
-            st.subheader("🤖 AI 종합 전망")
+                st.subheader(f"📝 Gemini의 '{ticker}' 심층 분석")
+                st.markdown(ai_report)
 
-            recent_sentiment_avg = df['sentiment_score'].mean()
-            outlook_title, reason_list = generate_outlook(corr, recent_sentiment_avg, stock_info, overview)
+                with st.expander("📚 분석에 참고한 뉴스 원문 보기"):
+                    if not df.empty:
+                        st.dataframe(
+                            df[['date', 'title', 'sentiment_label', 'url']],
+                            column_config={
+                                "date": st.column_config.DatetimeColumn("날짜", format="YYYY-MM-DD HH:mm"),
+                                "title": "기사 제목",
+                                "sentiment_label": "감성(AI분석)",
+                                "url": st.column_config.LinkColumn("링크", display_text="기사 보기")
+                            },
+                            hide_index=True,
+                            use_container_width=True
+                        )
+                    else:
+                        st.info("뉴스 데이터가 없음.")
 
-            st.success(f"### {outlook_title}")
-            for reason in reason_list:
-                st.markdown(f"- {reason}")
-
-            # 3. 뉴스 리스트
-            st.divider()
-            st.subheader(f"📰 관련 뉴스 ({len(df)}건)")
-
-            display_df = df[['date', 'title', 'sentiment_label', 'url', 'summary']].copy()
-            display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
-
-            st.dataframe(
-                display_df,
-                column_config={
-                    "date": "날짜",
-                    "title": "제목",
-                    "sentiment_label": "감성",
-                    "url": st.column_config.LinkColumn("링크", display_text="기사보기"),
-                    "summary": "요약"
-                },
-                hide_index=True,
-                use_container_width=True
-            )
+# ==========================================
+# ★ 푸터 (배경색 자동 맞춤 + 선 제거)
+# ==========================================
+st.markdown(
+    """
+    <style>
+    .footer {
+        position: fixed;
+        left: 0;
+        bottom: 0;
+        width: 100%;
+        background-color: var(--primary-background-color);
+        color: var(--text-color);
+        text-align: center;
+        padding: 10px;
+        font-size: 12px;
+        z-index: 999;
+        border-top: none; 
+    }
+    </style>
+    <div class="footer">
+        <p>Copyright © Made by sean-kim-27 (github) | Powered by Gemini | ⚠️ 투자는 본인의 선택이며 책임은 지지 않습니다.</p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)

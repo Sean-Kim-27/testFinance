@@ -2,3 +2,7 @@ streamlit
 pandas
 yfinance
 requests
+lxml
+textblob
+feedparser
+google-generativeai>=0.7.0
