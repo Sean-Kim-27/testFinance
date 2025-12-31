@@ -192,6 +192,7 @@ def get_ai_analysis(api_keys_list, market_info, news_df, extra_context=""):
     너는 월가 헤지펀드의 수석 애널리스트다. 
     지금 당장 '{market_info['ticker']}' 종목에 대한 **매수/매도 보고서** 를 작성해야 한다.
     단순한 정보 나열은 해고 사유다. 제공된 데이터를 바탕으로 **날카로운 통찰(Insight)** 을 제시해라.
+    그리고 제목에 보고서, 날짜가 들어가게 작성하지 마라.
 
     ### 1. [시장 데이터]
     - 현재가: ${market_info['current_price']}
@@ -278,9 +279,9 @@ with tab_stock:
 
     if c2.button("분석", key="s_btn", use_container_width=True):
         if not ticker:
-            e_stock.markdown('<div class="bubble">티커를 입력해라. (예: TSLA)</div>', unsafe_allow_html=True)
+            e_stock.markdown('<div class="bubble">티커를 입력하세요. (예: TSLA)</div>', unsafe_allow_html=True)
         elif not validate_ticker(ticker):
-            e_stock.markdown(f'<div class="bubble">\'{ticker}\' 는 없는 티커다.</div>', unsafe_allow_html=True)
+            e_stock.markdown(f'<div class="bubble">\'{ticker}\' 는 존재하지 않습니다.</div>', unsafe_allow_html=True)
         else:
             e_stock.empty()
 
@@ -339,11 +340,11 @@ with tab_crypto:
 
     if c2.button("분석", key="c_btn", use_container_width=True):
         if not c_ticker:
-            e_crypto.markdown('<div class="bubble">입력해라.</div>', unsafe_allow_html=True)
+            e_crypto.markdown('<div class="bubble">심볼을 입력해주세요. (예: BTC)</div>', unsafe_allow_html=True)
         else:
             valid, real_t = validate_crypto_ticker(c_ticker)
             if not valid:
-                e_crypto.markdown(f'<div class="bubble">\'{c_ticker}\' 없다.</div>', unsafe_allow_html=True)
+                e_crypto.markdown(f'<div class="bubble">\'{c_ticker}\' 는 존재하지 않습니다.</div>', unsafe_allow_html=True)
             else:
                 e_crypto.empty()
 
