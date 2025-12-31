@@ -58,7 +58,7 @@ def validate_crypto_ticker(ticker):
 
 
 # ==========================================
-# 2. 데이터 수집 (★ 주가 히스토리 추가됨!)
+# 2. 데이터 수집
 # ==========================================
 @st.cache_data(ttl=600, show_spinner=False)
 def get_data_stock(ticker):
@@ -78,14 +78,14 @@ def get_data_stock(ticker):
         })
     news_df = pd.DataFrame(news_list)
 
-    # [2] 주가 정보 & ★ 히스토리 (1년치)
+    # [2] 주가 정보
     stock = yf.Ticker(ticker)
     info = stock.info
     curr = info.get('currentPrice') or info.get('regularMarketPrice') or 0
     prev = info.get('previousClose') or 0
     rate = ((curr - prev) / prev) * 100 if prev > 0 else 0
 
-    # 1년치 주가 데이터 가져오기
+    # 1년치 주가 데이터
     history_df = stock.history(period="1y")
 
     stock_info = {
@@ -96,7 +96,7 @@ def get_data_stock(ticker):
         "business_summary": info.get('longBusinessSummary', '정보 없음')[:300] + "..."
     }
 
-    # [3] 재무제표 데이터
+    # [3] 재무제표
     financials = pd.DataFrame()
     financial_summary = "재무 데이터 없음"
     try:
@@ -111,13 +111,11 @@ def get_data_stock(ticker):
     except:
         pass
 
-    # 리턴값에 history_df 추가됨
     return news_df, stock_info, financials, financial_summary, history_df
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def get_data_crypto(ticker):
-    # 뉴스
     rss_url = f"https://news.google.com/rss/search?q={ticker}+crypto&hl=en-US&gl=US&ceid=US:en"
     feed = feedparser.parse(rss_url)
     news_list = []
@@ -133,14 +131,12 @@ def get_data_crypto(ticker):
         })
     news_df = pd.DataFrame(news_list)
 
-    # 코인 정보 & ★ 히스토리
     coin = yf.Ticker(ticker)
     info = coin.info
     curr = info.get('regularMarketPrice') or info.get('currentPrice') or 0
     prev = info.get('previousClose') or 0
     rate = ((curr - prev) / prev) * 100 if prev > 0 else 0
 
-    # 1년치 데이터
     history_df = coin.history(period="1y")
 
     stock_info = {
@@ -151,10 +147,9 @@ def get_data_crypto(ticker):
         "circulating_supply": info.get('circulatingSupply', 0),
         "business_summary": info.get('description', '정보 없음')[:300] + "..."
     }
-    return news_df, stock_info, history_df  # 코인은 재무제표 없으니까 3개만 리턴
+    return news_df, stock_info, history_df
 
 
-# 거시경제 지표
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_macro_data():
     try:
@@ -167,18 +162,16 @@ def get_macro_data():
 # 3. Gemini AI 분석
 # ==========================================
 def get_ai_analysis(api_keys_list, market_info, news_df, extra_context=""):
-    candidate_models = ["gemma-3-27b-it", "gemini-2.5-flash"]
+    candidate_models = ["gemma-3-27b-it", "gemma-3-4b-it", "gemini-2.5-flash"]
 
     if news_df.empty:
         news_txt = "특이 뉴스 없음."
     else:
-        # 뉴스 제목 + 감성(긍정/부정)을 같이 줘서 판단을 도움
         news_txt = "\n".join([
             f"- {row['title']} (감성: {row['sentiment_label']})"
             for _, row in news_df.iterrows()
         ])
 
-        # 자산 유형별 분석 포인트 설정
     asset_type = market_info.get('type', 'Stock')
     if asset_type == "Crypto":
         data_context = f"""
@@ -199,13 +192,12 @@ def get_ai_analysis(api_keys_list, market_info, news_df, extra_context=""):
     너는 월가 헤지펀드의 수석 애널리스트다. 
     지금 당장 '{market_info['ticker']}' 종목에 대한 **매수/매도 보고서** 를 작성해야 한다.
     단순한 정보 나열은 해고 사유다. 제공된 데이터를 바탕으로 **날카로운 통찰(Insight)** 을 제시해라.
-    그렇다고 정말 보고서 처럼 날짜, 제목을 정하지 마라.
 
     ### 1. [시장 데이터]
     - 현재가: ${market_info['current_price']}
     - 변동률: {market_info['change_rate']:.2f}% (오늘 흐름)
     {data_context}
-    
+
     ### 2. [추가 컨텍스트 (재무/매크로)]
     {extra_context}
 
@@ -219,7 +211,7 @@ def get_ai_analysis(api_keys_list, market_info, news_df, extra_context=""):
     **1단계: 뉴스 및 재료 해석 (News Impact)**
     - 뉴스를 단순히 요약하지 마라.
     - 각 뉴스가 주가에 **상승 재료(Bullish)** 인지 **하락 재료(Bearish)** 인지, 아니면 **소음(Noise)** 인지 판별해라.
-    - 해당 뉴스 별로 제목 + 해석을 일일이 작성하고 분석해라. 
+    - 해당 뉴스 별로 직접 링크에 들어가 기사를 해석하고 분석한 뒤에, 제목 + 분석을 일일이 작성해라. 그리고 기사 링크는 줄바꾸고 밑에 작성해라.
     - 시장의 공포/탐욕 심리가 현재 가격에 반영되었는지 분석해라.
 
     **2단계: 펀더멘털 및 매크로 진단 (Valuation & Macro)**
@@ -254,7 +246,7 @@ def get_ai_analysis(api_keys_list, market_info, news_df, extra_context=""):
 # ==========================================
 # 4. UI 구성
 # ==========================================
-st.set_page_config(page_title="AI 투자 분석 Pro", layout="wide")
+st.set_page_config(page_title="AI Fund & Crypto Analysis", layout="wide")
 
 st.markdown("""
 <style>
@@ -286,56 +278,58 @@ with tab_stock:
 
     if c2.button("분석", key="s_btn", use_container_width=True):
         if not ticker:
-            e_stock.markdown('<div class="bubble">입력해라.</div>', unsafe_allow_html=True)
+            e_stock.markdown('<div class="bubble">티커를 입력해라. (예: TSLA)</div>', unsafe_allow_html=True)
         elif not validate_ticker(ticker):
-            e_stock.markdown(f'<div class="bubble">\'{ticker}\' 없다.</div>', unsafe_allow_html=True)
+            e_stock.markdown(f'<div class="bubble">\'{ticker}\' 는 없는 티커다.</div>', unsafe_allow_html=True)
         else:
             e_stock.empty()
-            with st.spinner("주가 차트 그리는 중..."):
-                # ★ 리턴값 5개로 늘어남 (history_df 추가)
+
+            # [1단계] 데이터 수집 및 차트용 데이터 준비 -> "차트 생성중 ..."
+            with st.spinner("차트 생성중 ..."):
                 df, info, financials, fin_summary, history_df = get_data_stock(ticker)
                 macro_data = get_macro_data()
+
+            # [2단계] AI 분석 -> "기사 분석중 ..."
+            with st.spinner("기사 분석중 ... (최대 3분 소요)"):
                 rpt = get_ai_analysis(API_KEYS, info, df, extra_context=f"재무요약: {fin_summary}")
 
-                st.divider()
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("현재가", f"${info['current_price']}", f"{info['change_rate']:.2f}%")
-                m2.metric("목표가", f"${info['target_price']}")
-                m3.metric("PER", info['pe_ratio'])
-                m4.metric("의견", info['recommendation'])
+            # [3단계] 결과 화면 출력 (스피너 끝난 후)
+            st.divider()
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("현재가", f"${info['current_price']}", f"{info['change_rate']:.2f}%")
+            m2.metric("목표가", f"${info['target_price']}")
+            m3.metric("PER", info['pe_ratio'])
+            m4.metric("의견", info['recommendation'])
 
-                # [UI] ★ 주가 차트 (Line Chart)
-                st.subheader("📈 주가 추이 (1년)")
-                if not history_df.empty:
-                    # 종가(Close)만 뽑아서 그림
-                    st.line_chart(history_df['Close'], color="#00FF00")
+            st.subheader("📈 주가 추이 (1년)")
+            if not history_df.empty:
+                st.line_chart(history_df['Close'], color="#00FF00")
+            else:
+                st.warning("주가 데이터 없음")
+
+            st.subheader("📊 주요 실적 및 시장 지표")
+            chart_col1, chart_col2 = st.columns(2)
+
+            with chart_col1:
+                if not financials.empty:
+                    st.markdown("**💰 연간 실적 (매출/순이익)**")
+                    financials.index = financials.index.strftime('%Y-%m')
+                    st.bar_chart(financials[['Total Revenue', 'Net Income']])
                 else:
-                    st.warning("주가 데이터가 없다.")
+                    st.info("재무 데이터 없음")
 
-                # [UI] 실적 & 금리 차트
-                st.subheader("📊 주요 실적 및 시장 지표")
-                chart_col1, chart_col2 = st.columns(2)
+            with chart_col2:
+                if not macro_data.empty:
+                    st.markdown("**🇺🇸 미국 국채 10년물 금리**")
+                    st.line_chart(macro_data, color="#ff4b4b")
+                else:
+                    st.info("금리 데이터 없음")
 
-                with chart_col1:
-                    if not financials.empty:
-                        st.markdown("**💰 연간 실적 (매출/순이익)**")
-                        financials.index = financials.index.strftime('%Y-%m')
-                        st.bar_chart(financials[['Total Revenue', 'Net Income']])
-                    else:
-                        st.info("재무 데이터 없음")
+            st.subheader(f"📝 {info['ticker']} 리포트")
+            st.markdown(rpt)
 
-                with chart_col2:
-                    if not macro_data.empty:
-                        st.markdown("**🇺🇸 미국 국채 10년물 금리**")
-                        st.line_chart(macro_data, color="#ff4b4b")
-                    else:
-                        st.info("금리 데이터 없음")
-
-                st.subheader(f"📝 {info['ticker']} 리포트")
-                st.markdown(rpt)
-
-                with st.expander("뉴스"):
-                    st.dataframe(df[['date', 'title', 'sentiment_label', 'url']], hide_index=True)
+            with st.expander("뉴스"):
+                st.dataframe(df[['date', 'title', 'sentiment_label', 'url']], hide_index=True)
 
 # ----------------- 코인 탭 -----------------
 with tab_crypto:
@@ -352,34 +346,37 @@ with tab_crypto:
                 e_crypto.markdown(f'<div class="bubble">\'{c_ticker}\' 없다.</div>', unsafe_allow_html=True)
             else:
                 e_crypto.empty()
-                with st.spinner("차트 그리는 중..."):
-                    # ★ 리턴값 3개 (history_df 추가)
+
+                # [1단계] 데이터 수집 -> "차트 생성중 ..."
+                with st.spinner("차트 생성중 ..."):
                     df, info, history_df = get_data_crypto(real_t)
                     macro_data = get_macro_data()
+
+                # [2단계] AI 분석 -> "기사 분석중 ..."
+                with st.spinner("기사 분석중 ...(최대 3분 소요)"):
                     rpt = get_ai_analysis(API_KEYS, info, df, extra_context="암호화폐 시장은 매크로(금리) 민감도가 높음.")
 
-                    st.divider()
-                    k1, k2, k3, k4 = st.columns(4)
-                    k1.metric("현재가", f"${info['current_price']}", f"{info['change_rate']:.2f}%")
-                    k2.metric("시가총액", f"${info['market_cap']:,}")
-                    k3.metric("거래량", f"${info['volume']:,}")
-                    k4.metric("유통량", f"{info['circulating_supply']:,}")
+                # [3단계] 결과 출력
+                st.divider()
+                k1, k2, k3, k4 = st.columns(4)
+                k1.metric("현재가", f"${info['current_price']}", f"{info['change_rate']:.2f}%")
+                k2.metric("시가총액", f"${info['market_cap']:,}")
+                k3.metric("거래량", f"${info['volume']:,}")
+                k4.metric("유통량", f"{info['circulating_supply']:,}")
 
-                    # [UI] ★ 코인 차트 (Line Chart)
-                    st.subheader("📈 시세 추이 (1년)")
-                    if not history_df.empty:
-                        st.line_chart(history_df['Close'], color="#00FF00")
-                    else:
-                        st.warning("차트 데이터 없음")
+                st.subheader("📈 시세 추이 (1년)")
+                if not history_df.empty:
+                    st.line_chart(history_df['Close'], color="#00FF00")
+                else:
+                    st.warning("차트 데이터 없음")
 
-                    # 금리 차트
-                    st.subheader("📊 시장 지표")
-                    if not macro_data.empty:
-                        st.markdown("**🇺🇸 미국 국채 10년물 금리**")
-                        st.line_chart(macro_data, color="#ff4b4b")
+                st.subheader("📊 시장 지표")
+                if not macro_data.empty:
+                    st.markdown("**🇺🇸 미국 국채 10년물 금리**")
+                    st.line_chart(macro_data, color="#ff4b4b")
 
-                    st.subheader(f"🪙 {info['ticker']} 리포트")
-                    st.markdown(rpt)
+                st.subheader(f"🪙 {info['ticker']} 리포트")
+                st.markdown(rpt)
 
-                    with st.expander("뉴스"):
-                        st.dataframe(df[['date', 'title', 'sentiment_label', 'url']], hide_index=True)
+                with st.expander("뉴스"):
+                    st.dataframe(df[['date', 'title', 'sentiment_label', 'url']], hide_index=True)
